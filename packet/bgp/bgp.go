@@ -26,6 +26,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"encoding/hex"
 )
 
 type MarshallingOption struct {
@@ -53,6 +54,7 @@ const (
 	AFI_IP6    = 2
 	AFI_L2VPN  = 25
 	AFI_OPAQUE = 16397
+	AFI_LINKSTATE = 16388
 )
 
 const (
@@ -62,6 +64,7 @@ const (
 	SAFI_ENCAPSULATION            = 7
 	SAFI_VPLS                     = 65
 	SAFI_EVPN                     = 70
+	SAFI_LINKSTATE		      	  = 71
 	SAFI_MPLS_VPN                 = 128
 	SAFI_MPLS_VPN_MULTICAST       = 129
 	SAFI_ROUTE_TARGET_CONSTRAINTS = 132
@@ -4204,6 +4207,7 @@ const (
 	RF_FS_IPv6_VPN RouteFamily = AFI_IP6<<16 | SAFI_FLOW_SPEC_VPN
 	RF_FS_L2_VPN   RouteFamily = AFI_L2VPN<<16 | SAFI_FLOW_SPEC_VPN
 	RF_OPAQUE      RouteFamily = AFI_OPAQUE<<16 | SAFI_KEY_VALUE
+	RF_LINKSTATE   RouteFamily = AFI_LINKSTATE <<16 | SAFI_LINKSTATE
 )
 
 var AddressFamilyNameMap = map[RouteFamily]string{
@@ -4228,6 +4232,7 @@ var AddressFamilyNameMap = map[RouteFamily]string{
 	RF_FS_IPv6_VPN: "l3vpn-ipv6-flowspec",
 	RF_FS_L2_VPN:   "l2vpn-flowspec",
 	RF_OPAQUE:      "opaque",
+	RF_LINKSTATE:   "link-state",
 }
 
 var AddressFamilyValueMap = map[string]RouteFamily{
@@ -4252,6 +4257,7 @@ var AddressFamilyValueMap = map[string]RouteFamily{
 	AddressFamilyNameMap[RF_FS_IPv6_VPN]: RF_FS_IPv6_VPN,
 	AddressFamilyNameMap[RF_FS_L2_VPN]:   RF_FS_L2_VPN,
 	AddressFamilyNameMap[RF_OPAQUE]:      RF_OPAQUE,
+	AddressFamilyNameMap[RF_LINKSTATE]:   RF_LINKSTATE,
 }
 
 func GetRouteFamily(name string) (RouteFamily, error) {
@@ -4295,6 +4301,8 @@ func NewPrefixFromRouteFamily(afi uint16, safi uint8) (prefix AddrPrefixInterfac
 		prefix = &FlowSpecL2VPN{FlowSpecNLRI{rf: RF_FS_L2_VPN}}
 	case RF_OPAQUE:
 		prefix = &OpaqueNLRI{}
+	case RF_LINKSTATE:
+		prefix = NewLinkstateNlri()
 	default:
 		err = fmt.Errorf("unknown route family. AFI: %d, SAFI: %d", afi, safi)
 	}
@@ -4357,7 +4365,11 @@ const (
 	_
 	BGP_ATTR_TYPE_IP6_EXTENDED_COMMUNITIES             // = 25
 	BGP_ATTR_TYPE_AIGP                                 // = 26
+	_
+	_
+	BGP_ATTR_TYPE_LINKSTATE
 	BGP_ATTR_TYPE_LARGE_COMMUNITY          BGPAttrType = 32
+	BGP_ATTR_TYPE_OPAQUE_VALUE BGPAttrType = 41
 )
 
 // NOTIFICATION Error Code  RFC 4271 4.5.
@@ -4551,6 +4563,8 @@ var PathAttrFlags map[BGPAttrType]BGPAttrFlag = map[BGPAttrType]BGPAttrFlag{
 	BGP_ATTR_TYPE_IP6_EXTENDED_COMMUNITIES: BGP_ATTR_FLAG_TRANSITIVE | BGP_ATTR_FLAG_OPTIONAL,
 	BGP_ATTR_TYPE_AIGP:                     BGP_ATTR_FLAG_OPTIONAL,
 	BGP_ATTR_TYPE_LARGE_COMMUNITY:          BGP_ATTR_FLAG_TRANSITIVE | BGP_ATTR_FLAG_OPTIONAL,
+	BGP_ATTR_TYPE_OPAQUE_VALUE:         BGP_ATTR_FLAG_TRANSITIVE | BGP_ATTR_FLAG_OPTIONAL,
+	BGP_ATTR_TYPE_LINKSTATE:            BGP_ATTR_FLAG_OPTIONAL,
 }
 
 type PathAttributeInterface interface {
@@ -7804,6 +7818,10 @@ func GetPathAttribute(data []byte) (PathAttributeInterface, error) {
 		return &PathAttributeAigp{}, nil
 	case BGP_ATTR_TYPE_LARGE_COMMUNITY:
 		return &PathAttributeLargeCommunities{}, nil
+	case BGP_ATTR_TYPE_OPAQUE_VALUE:
+		return &PathAttributeOpaqueValue{}, nil
+	case BGP_ATTR_TYPE_LINKSTATE:
+		return &PathAttributeLinkstate{},nil
 	}
 	return &PathAttributeUnknown{}, nil
 }
@@ -8459,4 +8477,1904 @@ func FlatUpdate(f1, f2 map[string]string) error {
 	} else {
 		return nil
 	}
+}
+
+type Linkstate struct {
+	NlriType uint16
+	NlriLen uint16
+	NodeNlri LinkstateNodeNLRI
+	LinkNlri LinkstateLinkNLRI
+	PrefixNlri LinkstatePrefixNLRI
+}
+
+func (l *Linkstate) DecodeFromBytes(data []byte)error {
+
+	eCode := uint8(BGP_ERROR_UPDATE_MESSAGE_ERROR)
+	eSubCode := uint8(BGP_ERROR_SUB_MALFORMED_ATTRIBUTE_LIST)
+
+	odata:=data
+	l.NlriType = binary.BigEndian.Uint16(odata[0:2])
+	l.NlriLen = binary.BigEndian.Uint16(odata[2:4])
+	odata = odata [OFFSET_TLV_TYPE_LENGTH:OFFSET_TLV_TYPE_LENGTH+l.NlriLen]
+	if (l.NlriLen < 0){
+		return NewMessageError(eCode, eSubCode, nil, "LinkState NLRI Len is not enough")
+	}
+	switch l.NlriType {
+	case LINKSTATE_NODE_NLRI_TYPE:
+		LSNodeNLRI := &LinkstateNodeNLRI{}
+		_,err :=LSNodeNLRI.DecodeBytes(odata)
+		if err != nil {
+			return err
+		}
+		l.NodeNlri = *LSNodeNLRI
+	case LINKSTATE_LINK_NLRI_TYPE:
+		LSLinkNLRI := &LinkstateLinkNLRI{}
+		_,err := LSLinkNLRI.DecodeBytes(odata,l.NlriLen)
+		if err != nil {
+			return err
+		}
+		l.LinkNlri = *LSLinkNLRI
+	case LINKSTATE_PREFIX_NLRI_TYPE:
+		LSPrefixNLRI := &LinkstatePrefixNLRI{}
+		_,err := LSPrefixNLRI.DecodeBytes(odata)
+		if err!= nil {
+			return err
+		}
+		l.PrefixNlri = *LSPrefixNLRI
+		l.PrefixNlri.Type = "LINKSTATE_PREFIX_NLRI_TYPE"
+	}
+	return nil
+}
+
+func (l *Linkstate) Serialize()([]byte , error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],l.NlriType)
+	binary.BigEndian.PutUint16(buf[2:4],l.NlriLen)
+
+	switch l.NlriType {
+	case LINKSTATE_NODE_NLRI_TYPE:
+		tempBuf,err :=l.NodeNlri.Serialize()
+		if err != nil {
+			return nil,err
+		}
+		buf = append(buf,tempBuf...)
+	case LINKSTATE_LINK_NLRI_TYPE:
+		tempBuf,err :=l.LinkNlri.Serialize()
+		if err != nil {
+			return nil,err
+		}
+		buf = append(buf,tempBuf...)
+	case LINKSTATE_PREFIX_NLRI_TYPE:
+		tempBuf,err :=l.PrefixNlri.Serialize()
+		if err != nil {
+			return nil,err
+		}
+		buf = append(buf,tempBuf...)
+	}
+
+	return buf,nil
+}
+
+func (l *Linkstate) AFI()uint16 {
+	return AFI_LINKSTATE
+}
+
+func (l *Linkstate) SAFI()uint8 {
+	return SAFI_LINKSTATE
+}
+
+func (l *Linkstate) Flat()map[string]string {
+	return map[string]string{}
+}
+
+func (l *Linkstate) Len()int{
+	return int(l.NlriLen+4)
+}
+
+func (l *Linkstate) String()string {
+
+	switch l.NlriType {
+	case LINKSTATE_NODE_NLRI_TYPE:
+		return l.NodeNlri.String()
+	case LINKSTATE_LINK_NLRI_TYPE:
+		return l.LinkNlri.String()
+	case LINKSTATE_PREFIX_NLRI_TYPE:
+		return l.PrefixNlri.String()
+	}
+	return ""
+
+}
+
+func (l *Linkstate) MarshalJSON() ([]byte,error) {
+	switch l.NlriType {
+	case LINKSTATE_NODE_NLRI_TYPE:
+		return l.NodeNlri.MarshalJSON()
+	case LINKSTATE_LINK_NLRI_TYPE:
+		return l.LinkNlri.MarshalJSON()
+	case LINKSTATE_PREFIX_NLRI_TYPE:
+		return l.PrefixNlri.MarshalJSON()
+
+	}
+	return nil,nil
+}
+
+func (l *Linkstate) GetType () string {
+	switch l.NlriType {
+	case LINKSTATE_NODE_NLRI_TYPE:
+		return "NODE"
+	case LINKSTATE_LINK_NLRI_TYPE:
+		return "LINK"
+	case LINKSTATE_PREFIX_NLRI_TYPE:
+		return "PREFIX"
+	}
+	return ""
+
+}
+
+func NewLinkstateNlri()*Linkstate {
+	return &Linkstate{
+
+	}
+}
+
+
+const (
+	_ = iota
+	LINKSTATE_NODE_NLRI_TYPE
+	LINKSTATE_LINK_NLRI_TYPE
+	LINKSTATE_PREFIX_NLRI_TYPE
+)
+
+const (
+	LINKSTATE_IDENTIFIER_L3_TOPO = 0
+	LINKSTATE_ISIS_LEVEL2_PROTOCOl_ID = 2
+)
+
+const (
+	LINKSTATE_LOCAL_NODE_DESC = 256
+	LINKSTATE_REMOTE_NODE_DESC = 257
+	LINKSTATE_IPV4_INTF_ADDR_TLV =259
+	LINKSTATE_IPV4_NEIG_ADDR_TLV = 260
+	LINKSTATE_ASN_SYSTEM_TLV = 512
+	LINKSTATE_BGP_LS_ID_TLV = 513
+	LINKSTATE_IGP_RTR_ID_TLV = 515
+	LINKSTATE_IPREACHABILITY_TLV = 265
+)
+
+const (
+	LINKSTATE_LEN_TLV_TYPE = 2
+	LINKSTATE_LEN_TLV_LEN = 2
+	LINKSTATE_LEN_PROTOCOLID = 1
+	LINKSTATE_LEN_IDENTIFIER = 8
+)
+
+const OFFSET_TLV_TYPE_LENGTH = 4
+
+type LinkStateASNTlv struct {
+	Type uint16
+	Length uint16
+	ASNId uint32
+}
+
+type LinkstateBGPLSIDTlv struct {
+	Type uint16
+	Length uint16
+	BGPLSId uint32
+}
+
+type LinkstateIGPRtrID struct {
+	Type uint16
+	Length uint16
+	RtrID  []byte
+}
+
+type LinkstateNodeDesc struct {
+	Type uint16
+	Length uint16
+	NodeId string
+	ASNTlv LinkStateASNTlv
+	BGPLSIDTlv LinkstateBGPLSIDTlv
+	IGPRtrID LinkstateIGPRtrID
+}
+
+type LinkstateIPv4IntAddTlv struct {
+	Type uint16
+	Length uint16
+	IPv4IntfAddr string
+}
+
+type LinkstatePrefixDesc struct {
+	Type uint16
+	Length uint16
+	PrefixLen uint8
+	PrefixIP string
+	PrefixIPByte []byte
+
+}
+
+type LinkstateIPv4NeiAddTlv struct {
+	Type uint16
+	Length uint16
+	IPv4NeiAddr string
+}
+
+type LinkstateLinkDesc struct {
+	IPv4IntfAddr LinkstateIPv4IntAddTlv
+	IPv4NeigAddr LinkstateIPv4NeiAddTlv
+}
+
+type LinkstateNodeNLRI struct {
+	ProtocolID uint8
+	Identifier uint64
+	NodeDesc LinkstateNodeDesc
+	NodeId string
+	NodeID2 string
+}
+
+type LinkstateLinkNLRI struct {
+	ProtocolID uint8
+	Identifier uint64
+	LocalNodeDesc LinkstateNodeDesc
+	RemoteNodeDesc LinkstateNodeDesc
+	LinkDesc LinkstateLinkDesc
+}
+
+type LinkstatePrefixNLRI struct {
+	Type string
+	ProtocolID uint8
+	Identifier uint64
+	LocalNodeDesc LinkstateNodeDesc
+	PrefixDesc LinkstatePrefixDesc
+}
+
+func (self *LinkstatePrefixNLRI) DecodeBytes(data []byte)(*LinkstatePrefixNLRI,error){
+	odata:= data
+	self.ProtocolID = odata[0]
+	self.Identifier = binary.BigEndian.Uint64(odata[1:9])
+	self.LocalNodeDesc.Type = binary.BigEndian.Uint16(odata[9:11])
+	self.LocalNodeDesc.Length = binary.BigEndian.Uint16(odata[11:13])
+	odata = odata[9:]
+	for len(odata)>0 {
+		tlvType := binary.BigEndian.Uint16(odata[:2])
+		tlvLen := binary.BigEndian.Uint16(odata[2:4])
+		switch tlvType {
+		case LINKSTATE_LOCAL_NODE_DESC:
+			self.LocalNodeDesc = NodeDecodeBytes(odata[OFFSET_TLV_TYPE_LENGTH:OFFSET_TLV_TYPE_LENGTH+self.LocalNodeDesc.Length],tlvType,tlvLen)
+			odata = odata[OFFSET_TLV_TYPE_LENGTH+self.LocalNodeDesc.Length:]
+		case LINKSTATE_IPREACHABILITY_TLV:
+			self.PrefixDesc.Type = tlvType
+			self.PrefixDesc.Length = tlvLen
+			self.PrefixDesc.PrefixLen = odata[4]
+			self.PrefixDesc.PrefixIP = HexToIP(odata[5:4+self.PrefixDesc.Length])
+			self.PrefixDesc.PrefixIPByte = odata[5:4+self.PrefixDesc.Length]
+			odata = odata[OFFSET_TLV_TYPE_LENGTH+self.PrefixDesc.Length:]
+		}
+	}
+
+	return self,nil
+}
+
+func (self *LinkstatePrefixNLRI) String() string{
+	s := bytes.NewBuffer(make([]byte,1))
+	if self.ProtocolID == 2 {
+		s.WriteString(fmt.Sprintf("[T]{%s}","L2"))
+	}
+
+	s.WriteString(fmt.Sprintf("{c%d}",self.LocalNodeDesc.ASNTlv.ASNId))
+	s.WriteString(fmt.Sprintf("{b%s}",Long2IP(self.LocalNodeDesc.BGPLSIDTlv.BGPLSId)))
+	s.WriteString(fmt.Sprintf("{s%s}",self.LocalNodeDesc.NodeId))
+	s.WriteString(fmt.Sprintf("{P%s/%d}",self.PrefixDesc.PrefixIP,self.PrefixDesc.PrefixLen))
+	return s.String()
+}
+
+func (self *LinkstatePrefixNLRI) Serialize()([]byte,error) {
+	buf := make([]byte,9)
+	buf[0] = self.ProtocolID
+	binary.BigEndian.PutUint64(buf[1:9],self.Identifier)
+	if self.LocalNodeDesc.Length > 0 {
+		nodebuf,err := NodeSerialize(&self.LocalNodeDesc)
+		if err != nil {
+			return nil,err
+		}
+		buf = append(buf,nodebuf...)
+	}
+	if self.PrefixDesc.Length > 0 {
+		prefixbuf,err := PrefixSerialize(&self.PrefixDesc)
+		if err != nil {
+			return nil,err
+		}
+		buf = append(buf,prefixbuf...)
+	}
+	return buf,nil
+}
+
+func (self *LinkstatePrefixNLRI) MarshalJSON()([]byte,error){
+	return json.Marshal(struct {
+		NlriType string `json:"nlritype"`
+		Nodeid string  `json:"nodeid"`
+		Prefix string  `json:"prefix"`
+		Prefixlen uint8  `json:"prefixlen"`
+	}{
+		NlriType: "prefix",
+		Nodeid: self.LocalNodeDesc.NodeId,
+		Prefix: self.PrefixDesc.PrefixIP,
+		Prefixlen: self.PrefixDesc.PrefixLen,
+	})
+}
+
+func PrefixSerialize (p *LinkstatePrefixDesc)([]byte,error){
+	buf := make([]byte,5)
+	binary.BigEndian.PutUint16(buf[0:2],p.Type)
+	binary.BigEndian.PutUint16(buf[2:4],p.Length)
+	buf[4] = p.PrefixLen
+	buf = append(buf,p.PrefixIPByte...)
+	return buf,nil
+}
+
+func (self *LinkstateLinkNLRI) DecodeBytes(data []byte,nlriLen uint16)(*LinkstateLinkNLRI,error) {
+	odata := data
+	self.ProtocolID = odata[0]
+	self.Identifier = binary.BigEndian.Uint64(odata[1:9])
+	self.LocalNodeDesc.Type = binary.BigEndian.Uint16(odata[9:11])
+	self.LocalNodeDesc.Length = binary.BigEndian.Uint16(odata[11:13])
+	odata = odata[9:]
+	for len(odata) > 0 {
+		tlvType := binary.BigEndian.Uint16(odata[:2])
+		tlvLen := binary.BigEndian.Uint16(odata[2:4])
+		switch tlvType {
+		case LINKSTATE_LOCAL_NODE_DESC:
+			self.LocalNodeDesc.Type = tlvType
+			self.LocalNodeDesc.Length = tlvLen
+			self.LocalNodeDesc = NodeDecodeBytes(odata[OFFSET_TLV_TYPE_LENGTH:OFFSET_TLV_TYPE_LENGTH+self.LocalNodeDesc.Length],tlvType,tlvLen)
+			odata = odata[OFFSET_TLV_TYPE_LENGTH+self.LocalNodeDesc.Length:]
+		case LINKSTATE_REMOTE_NODE_DESC:
+			self.RemoteNodeDesc.Type = tlvType
+			self.RemoteNodeDesc.Length = tlvLen
+			self.RemoteNodeDesc = NodeDecodeBytes(odata[OFFSET_TLV_TYPE_LENGTH:OFFSET_TLV_TYPE_LENGTH+self.RemoteNodeDesc.Length],tlvType,tlvLen)
+			odata = odata[OFFSET_TLV_TYPE_LENGTH+self.RemoteNodeDesc.Length:]
+		case LINKSTATE_IPV4_INTF_ADDR_TLV:
+			self.LinkDesc.IPv4IntfAddr.Type = tlvType
+			self.LinkDesc.IPv4IntfAddr.Length = tlvLen
+			self.LinkDesc.IPv4IntfAddr.IPv4IntfAddr = net.IP.String(odata[4:8])
+			odata = odata[OFFSET_TLV_TYPE_LENGTH+self.LinkDesc.IPv4IntfAddr.Length:]
+		case LINKSTATE_IPV4_NEIG_ADDR_TLV:
+			self.LinkDesc.IPv4NeigAddr.Type = tlvType
+			self.LinkDesc.IPv4NeigAddr.Length = tlvLen
+			self.LinkDesc.IPv4NeigAddr.IPv4NeiAddr = net.IP.String(odata[4:8])
+			odata = odata[OFFSET_TLV_TYPE_LENGTH+self.LinkDesc.IPv4NeigAddr.Length:]
+		}
+	}
+	return self,nil
+
+}
+
+func (self *LinkstateLinkNLRI) String () string{
+	s := bytes.NewBuffer(make([]byte,1))
+	if self.ProtocolID == 2 {
+		s.WriteString(fmt.Sprintf("[E]{%s}","L2"))
+	}
+	s.WriteString(fmt.Sprintf("{Nc%d}",self.LocalNodeDesc.ASNTlv.ASNId))
+	s.WriteString(fmt.Sprintf("{b%s}",Long2IP(self.LocalNodeDesc.BGPLSIDTlv.BGPLSId)))
+	s.WriteString(fmt.Sprintf("{s%s}",self.LocalNodeDesc.NodeId))
+
+	s.WriteString(fmt.Sprintf("{Rc%d}",self.RemoteNodeDesc.ASNTlv.ASNId))
+	s.WriteString(fmt.Sprintf("{b%s}",Long2IP(self.RemoteNodeDesc.BGPLSIDTlv.BGPLSId)))
+	s.WriteString(fmt.Sprintf("{s%s}",self.RemoteNodeDesc.NodeId))
+
+	if self.LinkDesc.IPv4IntfAddr.Length > 0 {
+		s.WriteString(fmt.Sprintf("{Li%s}",self.LinkDesc.IPv4IntfAddr.IPv4IntfAddr))
+	}
+
+	if self.LinkDesc.IPv4NeigAddr.Length > 0 {
+		s.WriteString(fmt.Sprintf("{n%s}",self.LinkDesc.IPv4NeigAddr.IPv4NeiAddr))
+	}
+
+	return s.String()
+}
+
+func (self *LinkstateLinkNLRI) Serialize()([]byte,error){
+	buf := make([]byte,9)
+	buf[0] = self.ProtocolID
+	binary.BigEndian.PutUint64(buf[1:9],self.Identifier)
+	if self.LocalNodeDesc.Length > 0 {
+		localnodebuf,err := NodeSerialize(&self.LocalNodeDesc)
+		if err != nil {
+			return nil,err
+		}
+		buf = append(buf,localnodebuf...)
+	}
+	if self.RemoteNodeDesc.Length > 0 {
+		remotenodebuf,err := NodeSerialize(&self.RemoteNodeDesc)
+		if err != nil {
+			return nil,err
+		}
+		buf = append(buf,remotenodebuf...)
+	}
+	if self.LinkDesc.IPv4IntfAddr.Length > 0 {
+		ipintbuf,err := IPv4IntSerialize(&self.LinkDesc.IPv4IntfAddr)
+		if err != nil {
+			return nil,err
+		}
+		buf = append(buf,ipintbuf...)
+	}
+	if self.LinkDesc.IPv4NeigAddr.Length > 0 {
+		ipneibuf,err := IPv4NeiSerialize(&self.LinkDesc.IPv4NeigAddr)
+		if err != nil {
+			return nil,err
+		}
+		buf = append(buf,ipneibuf...)
+	}
+	return buf,nil
+}
+
+func (self *LinkstateLinkNLRI) MarshalJSON() ([]byte,error) {
+	return json.Marshal(struct {
+		NlriType string 	`json:"nlritype"`
+		Protocol string 	`json:"protocol"`
+		LocalNode string        `json:"localnode"`
+		RemoteNode string	`json:"remotenode"`
+		LocalIP string 		`json:"localip"`
+		RemoteIP string 	`json:"remoteip"`
+	}{
+		NlriType: "link",
+		Protocol: GetProtocolType(self.ProtocolID),
+		LocalNode: self.LocalNodeDesc.NodeId,
+		RemoteNode: self.RemoteNodeDesc.NodeId,
+		LocalIP: self.LinkDesc.IPv4IntfAddr.IPv4IntfAddr,
+		RemoteIP: self.LinkDesc.IPv4NeigAddr.IPv4NeiAddr,
+	})
+}
+
+func IPv4IntSerialize (i *LinkstateIPv4IntAddTlv)([]byte,error) {
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],i.Type)
+	binary.BigEndian.PutUint16(buf[2:4],i.Length)
+	ip := net.ParseIP(i.IPv4IntfAddr)
+	ipbuf := new (bytes.Buffer)
+	err := binary.Write(ipbuf,binary.BigEndian,ip.To4())
+	if err != nil {
+		return nil,err
+	}
+	buf = append(buf,ipbuf.Bytes()...)
+
+	return buf,nil
+}
+
+func IPv4NeiSerialize (i *LinkstateIPv4NeiAddTlv)([]byte,error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],i.Type)
+	binary.BigEndian.PutUint16(buf[2:4],i.Length)
+	ip := net.ParseIP(i.IPv4NeiAddr)
+	ipbuf := new (bytes.Buffer)
+	err := binary.Write(ipbuf,binary.BigEndian,ip.To4())
+	if err != nil {
+		return nil, err
+	}
+	buf = append(buf,ipbuf.Bytes()...)
+
+	return buf,nil
+
+}
+
+func NodeDecodeBytes(data []byte,tlvType,tlvLen uint16)(LinkstateNodeDesc) {
+	odata1 := data
+	nodeDesc := LinkstateNodeDesc{}
+	nodeDesc.Type = tlvType
+	nodeDesc.Length = tlvLen
+	for len(odata1) >0 {
+		tlvType := binary.BigEndian.Uint16(odata1[:2])
+		tlvLen := binary.BigEndian.Uint16(odata1[2:4])
+		switch tlvType {
+		case LINKSTATE_ASN_SYSTEM_TLV:
+			Asntlv := &LinkStateASNTlv{}
+			Asntlv.Type = tlvType
+			Asntlv.Length = tlvLen
+			Asntlv.ASNId = binary.BigEndian.Uint32(odata1[4:8])
+			nodeDesc.ASNTlv = *Asntlv
+			odata1 = odata1[(OFFSET_TLV_TYPE_LENGTH+Asntlv.Length):]
+		case LINKSTATE_BGP_LS_ID_TLV:
+			BgpLSID := &LinkstateBGPLSIDTlv{}
+			BgpLSID.Type = tlvType
+			BgpLSID.Length = tlvLen
+			BgpLSID.BGPLSId = binary.BigEndian.Uint32(odata1[4:8])
+			nodeDesc.BGPLSIDTlv = *BgpLSID
+			odata1 = odata1[(OFFSET_TLV_TYPE_LENGTH+BgpLSID.Length):]
+		case LINKSTATE_IGP_RTR_ID_TLV:
+			IgpRtrID := &LinkstateIGPRtrID{}
+			IgpRtrID.Type = tlvType
+			IgpRtrID.Length = tlvLen
+			IgpRtrID.RtrID = odata1[4:(4+IgpRtrID.Length)]
+			nodeDesc.IGPRtrID = *IgpRtrID
+			nodeDesc.NodeId = isisNodeformat(IgpRtrID.RtrID)
+			odata1 = odata1[(OFFSET_TLV_TYPE_LENGTH+IgpRtrID.Length):]
+		}
+	}
+	return nodeDesc
+}
+
+func (n *LinkstateNodeNLRI) DecodeBytes(data []byte)(*LinkstateNodeNLRI,error) {
+	odata:= data
+	n.ProtocolID = odata[0]
+	n.Identifier = binary.BigEndian.Uint64(odata[1:9])
+	n.NodeDesc.Type = binary.BigEndian.Uint16(odata[9:11])
+	n.NodeDesc.Length = binary.BigEndian.Uint16(odata[11:13])
+
+	odata = odata[13:]
+	for len(odata) >0 {
+		tlvType := binary.BigEndian.Uint16(odata[:2])
+		tlvLen := binary.BigEndian.Uint16(odata[2:4])
+		switch tlvType {
+		case LINKSTATE_ASN_SYSTEM_TLV:
+			Asntlv := &LinkStateASNTlv{}
+			Asntlv.Type = tlvType
+			Asntlv.Length = tlvLen
+			Asntlv.ASNId = binary.BigEndian.Uint32(odata[4:8])
+			n.NodeDesc.ASNTlv = *Asntlv
+			odata = odata[(OFFSET_TLV_TYPE_LENGTH+Asntlv.Length):]
+		case LINKSTATE_BGP_LS_ID_TLV:
+			BgpLSID := &LinkstateBGPLSIDTlv{}
+			BgpLSID.Type = tlvType
+			BgpLSID.Length = tlvLen
+			BgpLSID.BGPLSId = binary.BigEndian.Uint32(odata[4:8])
+			n.NodeDesc.BGPLSIDTlv = *BgpLSID
+			odata = odata[(OFFSET_TLV_TYPE_LENGTH+BgpLSID.Length):]
+		case LINKSTATE_IGP_RTR_ID_TLV:
+			IgpRtrID := &LinkstateIGPRtrID{}
+			IgpRtrID.Type = tlvType
+			IgpRtrID.Length = tlvLen
+			IgpRtrID.RtrID = odata[4:(4+IgpRtrID.Length)]
+			n.NodeDesc.IGPRtrID = *IgpRtrID
+			n.NodeId = isisNodeformat(IgpRtrID.RtrID)
+			odata = odata[(OFFSET_TLV_TYPE_LENGTH+IgpRtrID.Length):]
+		}
+	}
+	return n,nil
+}
+
+func (n *LinkstateNodeNLRI) Serialize()([]byte,error){
+	buf := make([]byte,9)
+	buf[0] = n.ProtocolID
+	binary.BigEndian.PutUint64(buf[1:9],n.Identifier)
+	tempBuf,err := NodeSerialize(&n.NodeDesc)
+	if err != nil {
+		return nil,err
+	}
+	buf = append(buf,tempBuf...)
+	return buf,nil
+
+}
+
+func NodeSerialize(node *LinkstateNodeDesc)([]byte,error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],node.Type)
+	binary.BigEndian.PutUint16(buf[2:4],node.Length)
+
+	if (node.ASNTlv.Length) > 0 {
+		asnbuf := make([]byte,8)
+		binary.BigEndian.PutUint16(asnbuf[0:2],node.ASNTlv.Type)
+		binary.BigEndian.PutUint16(asnbuf[2:4],node.ASNTlv.Length)
+		binary.BigEndian.PutUint32(asnbuf[4:8],node.ASNTlv.ASNId)
+		buf = append(buf,asnbuf...)
+	}
+	if (node.BGPLSIDTlv.Length) > 0 {
+		lsidbuf := make([]byte,8)
+		binary.BigEndian.PutUint16(lsidbuf[0:2],node.BGPLSIDTlv.Type)
+		binary.BigEndian.PutUint16(lsidbuf[2:4],node.BGPLSIDTlv.Length)
+		binary.BigEndian.PutUint32(lsidbuf[4:8],node.BGPLSIDTlv.BGPLSId)
+		buf = append(buf,lsidbuf...)
+	}
+	if (node.IGPRtrID.Length) > 0 {
+		igpbuf := make([]byte,4)
+		binary.BigEndian.PutUint16(igpbuf[0:2],node.IGPRtrID.Type)
+		binary.BigEndian.PutUint16(igpbuf[2:4],node.IGPRtrID.Length)
+		tempbuf := make([]byte,node.IGPRtrID.Length)
+		tempbuf = node.IGPRtrID.RtrID
+		igpbuf = append(igpbuf,tempbuf...)
+		buf = append(buf,igpbuf...)
+	}
+	return buf,nil
+}
+
+func (n *LinkstateNodeNLRI) String() string{
+	s := bytes.NewBuffer(make([]byte,1))
+	if n.ProtocolID == 2 {
+		s.WriteString(fmt.Sprintf("[V]{%s}","L2"))
+	}
+	s.WriteString(fmt.Sprintf("{[c%d]}",n.NodeDesc.ASNTlv.ASNId))
+	s.WriteString(fmt.Sprintf("{b%s}",Long2IP(n.NodeDesc.BGPLSIDTlv.BGPLSId)))
+	s.WriteString(fmt.Sprintf("{s%s}",n.NodeId))
+	return s.String()
+
+}
+
+func (n *LinkstateNodeNLRI) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		NlriType string `json:"nlritype"`
+		Protocol string `json:"protocol"`
+		Asn uint32      `json:"asn"`
+		BgpLSID string  `json:"bgplsid"`
+		NodeID string   `json:"nodeid"`
+
+	}{
+		NlriType: "node",
+		Protocol: GetProtocolType(n.ProtocolID),
+		Asn:	 n.NodeDesc.ASNTlv.ASNId,
+		BgpLSID: Long2IP(n.NodeDesc.BGPLSIDTlv.BGPLSId),
+		NodeID: n.NodeId,
+	})
+}
+
+
+type LinkStateAttrType uint16
+
+const(
+	LS_TLV_TYPE_MULTI_TOPO_ID    LinkStateAttrType = 263
+	LS_TLV_TYPE_NODE_FLAG_BITS   LinkStateAttrType = 1024
+	LS_TLV_TYPE_OPAQUE_NODE_PROP LinkStateAttrType = 1025
+	LS_TLV_TYPE_NODE_NAME        LinkStateAttrType = 1026
+	LS_TLV_TYPE_ISIS_AREA_ID     LinkStateAttrType = 1027
+	LS_TLV_TYPE_IPV4_RID_LOCAL   LinkStateAttrType = 1028
+	LS_TLV_TYPE_IPV6_RID_LOCAL   LinkStateAttrType = 1029
+	LS_TLV_TYPE_IPV4_RID_REMOTE  LinkStateAttrType = 1030
+	LS_TLV_TYPE_IPV6_RID_REMOTE  LinkStateAttrType = 1031
+	LS_TLV_TYPE_COLOR            LinkStateAttrType = 1088
+	LS_TLV_TYPE_MAX_LINK_BW      LinkStateAttrType = 1089
+	LS_TLV_TYPE_MAX_RES_BW       LinkStateAttrType = 1090
+	LS_TLV_TYPE_UNRES_BW         LinkStateAttrType = 1091
+	LS_TLV_TYPE_TE_DEF_METRIC    LinkStateAttrType = 1092
+	LS_TLV_TYPE_LINK_PROT_TYPE   LinkStateAttrType = 1093
+	LS_TLV_TYPE_MPLS_PROT_MASK   LinkStateAttrType = 1094
+	LS_TLV_TYPE_METRIC           LinkStateAttrType = 1095
+	LS_TLV_TYPE_SRLG             LinkStateAttrType = 1096
+	LS_TLV_TYPE_OPAQUE_LINK_ATTR LinkStateAttrType = 1097
+	LS_TLV_TYPE_LINK_NAME_ATTR   LinkStateAttrType = 1098
+	LS_TLV_TYPE_IGP_FLAGS        LinkStateAttrType = 1152
+	LS_TLV_TYPE_ROUTE_TAG        LinkStateAttrType = 1153
+	LS_TLV_TYPE_EXT_TAG          LinkStateAttrType = 1154
+	LS_TLV_TYPE_PREFIX_METRIC    LinkStateAttrType = 1155
+	LS_TLV_TYPE_OSPF_FW_ADDR     LinkStateAttrType = 1156
+	LS_TLV_TYPE_OPAQUE_PFX_ATTR  LinkStateAttrType = 1157
+	LS_TLV_TYPE_PREFIX_SID       LinkStateAttrType = 1158
+	LS_TLV_TYPE_SR_CAPABILITIES  LinkStateAttrType = 1034
+	LS_TLV_TYPE_ADJ_SID          LinkStateAttrType = 1099
+	LS_TLV_TYPE_LAN_ADJ_SID      LinkStateAttrType = 1100
+)
+
+type LinkstateTlvValue interface {
+	Serialize()([]byte,error)
+	DecodeFromBytes(data []byte) error
+	String () string
+	MarshalJSON()([]byte,error)
+	Len()int
+}
+
+type PathAttributeLinkstate struct {
+	PathAttribute
+	Value []LinkstateTlvValue
+}
+
+func NewLSPathAttributeTlv(Type uint16)(LinkstateTlvValue,error){
+	tlvType := LinkStateAttrType(Type)
+	switch tlvType {
+	case LS_TLV_TYPE_IPV4_RID_LOCAL:
+		return NewLinkStateRIDv4Local(),nil
+	case LS_TLV_TYPE_IPV4_RID_REMOTE:
+		return NewLinkStateRIDv4Remote(),nil
+	case LS_TLV_TYPE_NODE_NAME:
+		return NewLinkStateNodeName(),nil
+	case LS_TLV_TYPE_ISIS_AREA_ID:
+		return NewLinkStateISISAreaID(),nil
+	case LS_TLV_TYPE_MAX_LINK_BW:
+		return NewLinkStateMaxLinkBW(),nil
+	case LS_TLV_TYPE_MAX_RES_BW:
+		return NewLinkStateMaxResvBW(),nil
+	case LS_TLV_TYPE_METRIC:
+		return NewLinkStateMetric(),nil
+	case LS_TLV_TYPE_PREFIX_METRIC:
+		return NewLinkStatePrefixMetric(),nil
+	case LS_TLV_TYPE_COLOR:
+		return NewLinkStateAdminGroup(),nil
+	case LS_TLV_TYPE_UNRES_BW:
+		return NewLinkStateUnResvBW(),nil
+	case LS_TLV_TYPE_TE_DEF_METRIC:
+		return NewLinkStateTEDEFMetric(),nil
+	case LS_TLV_TYPE_PREFIX_SID:
+		return NewPrefixSid(),nil
+	case LS_TLV_TYPE_SR_CAPABILITIES:
+		return NewSRCapTlv(),nil
+	case LS_TLV_TYPE_LAN_ADJ_SID:
+		return NewLanAdjSidTlv(),nil
+	case LS_TLV_TYPE_ADJ_SID:
+		return NewAdjSidTlv(),nil
+	}
+	return &PathAttributeUnknown{},nil
+}
+
+func (self *PathAttributeLinkstate) DecodeFromBytes(data []byte) error {
+	err := self.PathAttribute.DecodeFromBytes(data)
+	if err != nil {
+		return err
+	}
+	//TODO: Look at the Error Codes Later.
+	eCode := uint8(BGP_ERROR_UPDATE_MESSAGE_ERROR)
+	eSubCode := uint8(BGP_ERROR_SUB_ATTRIBUTE_LENGTH_ERROR)
+	value := self.PathAttribute.Value
+	if len(value) < 3 {
+		return NewMessageError(eCode, eSubCode, value, "PathAttribute length is short")
+	}
+	for len(value) > 0 {
+		tlvType:= binary.BigEndian.Uint16(value[0:2])
+		lstlv,err := NewLSPathAttributeTlv(tlvType)
+
+		if err != nil {
+			return err
+		}
+		err = lstlv.DecodeFromBytes(value)
+		if err != nil {
+			return err
+		}
+		if lstlv.Len() > len(value){
+			return NewMessageError(eCode, eSubCode, value, "length is incorrect")
+		}
+		value = value[lstlv.Len():]
+		self.Value = append(self.Value,lstlv)
+	}
+	return nil
+}
+
+func (self *PathAttributeLinkstate) Serialize() ([]byte,error) {
+	buf := make([]byte,0)
+	for _,lstlv := range self.Value {
+		pbuf,err := lstlv.Serialize()
+		if err != nil {
+			return nil,err
+		}
+		buf = append(buf,pbuf...)
+	}
+	self.PathAttribute.Value = buf
+	return self.PathAttribute.Serialize()
+}
+
+func (p *PathAttributeLinkstate) String() string {
+	return fmt.Sprintf("{BGPLS:%v}", p.Value)
+}
+
+func (p *PathAttributeLinkstate) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Type  BGPAttrType `json:"type"`
+		Value []LinkstateTlvValue     `json:"LSAttributeValue"`
+	}{
+		Type:  p.GetType(),
+		Value: p.Value,
+	})
+}
+
+type LinkStateRIDv4Remote struct {
+	Type   LinkStateAttrType
+	Length uint16
+	RID    uint32
+}
+
+func NewLinkStateRIDv4Remote()*LinkStateRIDv4Remote {
+	return &LinkStateRIDv4Remote {
+	}
+}
+
+func (self *LinkStateRIDv4Remote) DecodeFromBytes(data []byte)error {
+	odata := data
+	offset := uint16(4)
+	self.Type = LS_TLV_TYPE_IPV4_RID_REMOTE
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.RID = binary.BigEndian.Uint32(odata[offset:offset+self.Length])
+	return nil
+}
+
+func (self *LinkStateRIDv4Remote) Serialize()([]byte,error){
+	buf := make([]byte,8)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	binary.BigEndian.PutUint32(buf[4:8],self.RID)
+	return buf,nil
+}
+
+func (self *LinkStateRIDv4Remote) String()(string){
+	return fmt.Sprintf("{R:%s}",Long2IP(self.RID))
+
+}
+
+func (self *LinkStateRIDv4Remote) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Value string 		`json:"value"`
+	}{
+		Type: self.Type,
+		Value: Long2IP(self.RID),
+	})
+}
+
+func (self *LinkStateRIDv4Remote) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type LinkStateRIDv4Local struct {
+	Type   LinkStateAttrType
+	Length uint16
+	RID    uint32
+}
+
+func NewLinkStateRIDv4Local()*LinkStateRIDv4Local {
+	return &LinkStateRIDv4Local {
+
+	}
+}
+
+func (self *LinkStateRIDv4Local) DecodeFromBytes(data []byte)error {
+	odata := data
+	self.Type = LS_TLV_TYPE_IPV4_RID_LOCAL
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.RID = binary.BigEndian.Uint32(odata[OFFSET_TLV_TYPE_LENGTH:OFFSET_TLV_TYPE_LENGTH+self.Length])
+	return nil
+}
+
+func (self *LinkStateRIDv4Local) Serialize()([]byte,error){
+	buf := make([]byte,4+self.Length)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	binary.BigEndian.PutUint32(buf[4:8],self.RID)
+	return buf,nil
+}
+
+func (self *LinkStateRIDv4Local) String()(string){
+	return fmt.Sprintf("{L:%s}",Long2IP(self.RID))
+}
+
+func (self *LinkStateRIDv4Local) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Value string 		`json:"value"`
+
+	}{
+		Type: self.Type,
+		Value: Long2IP(self.RID),
+	})
+}
+
+func (self *LinkStateRIDv4Local) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type LinkStateMetric struct {
+	Type   LinkStateAttrType
+	Length uint16
+	Metric []byte
+}
+
+func NewLinkStateMetric()*LinkStateMetric {
+	return &LinkStateMetric{
+
+	}
+}
+
+func (self *LinkStateMetric) DecodeFromBytes(data []byte)error {
+	odata := data
+	self.Type = LS_TLV_TYPE_METRIC
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.Metric = (odata[4:4+self.Length])
+	return nil
+}
+
+func (self *LinkStateMetric) Serialize()([]byte,error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf = append(buf,self.Metric...)
+	return buf,nil
+}
+
+func (self *LinkStateMetric) String()(string){
+	s := bytes.NewBuffer(make([]byte,0))
+	s.WriteString(fmt.Sprintf("{Cost:%d}",HexToInt(self.Metric)))
+	return s.String()
+}
+
+func (self *LinkStateMetric) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Value interface{} `json:"value"`
+	}{
+		Type: self.Type,
+		Value: HexToInt(self.Metric),
+	})
+}
+
+func (self *LinkStateMetric) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type LinkStateISISAreaID struct {
+	Type   LinkStateAttrType
+	Length uint16
+	AreaID []byte
+}
+
+func NewLinkStateISISAreaID()*LinkStateISISAreaID {
+	return &LinkStateISISAreaID{
+
+	}
+}
+
+func (self *LinkStateISISAreaID) DecodeFromBytes(data []byte)error {
+	odata := data
+	self.Type = LS_TLV_TYPE_ISIS_AREA_ID
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.AreaID = odata[OFFSET_TLV_TYPE_LENGTH:OFFSET_TLV_TYPE_LENGTH+self.Length]
+	return nil
+}
+
+func (self *LinkStateISISAreaID) Serialize()([]byte,error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	tempbuf := make([]byte,self.Length)
+	tempbuf = self.AreaID
+	buf = append(buf,tempbuf...)
+	return buf,nil
+}
+
+func (self *LinkStateISISAreaID) String()(string){
+	s := bytes.NewBuffer(make([]byte,0))
+	s.WriteString(fmt.Sprintf("{AreaID:%s}",HexToString(self.AreaID)))
+	return s.String()
+
+}
+
+func (self *LinkStateISISAreaID) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Value string 		`json:"AreaID"`
+	}{
+		Type: self.Type,
+		Value: (HexToString(self.AreaID)),
+	})
+}
+
+func (self *LinkStateISISAreaID) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type LinkStateNodeName struct {
+	Type   LinkStateAttrType
+	Length uint16
+	NodeName []byte
+}
+
+func NewLinkStateNodeName()*LinkStateNodeName {
+	return &LinkStateNodeName{
+
+	}
+}
+
+func (self *LinkStateNodeName) DecodeFromBytes(data []byte)error {
+	odata := data
+	offset := uint16(4)
+	self.Type = LS_TLV_TYPE_NODE_NAME
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.NodeName = odata[offset:offset+self.Length]
+	return nil
+}
+
+func (self *LinkStateNodeName) Serialize()([]byte,error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf = append(buf,self.NodeName...)
+	return buf,nil
+}
+
+func (self *LinkStateNodeName) String()(string){
+	s := bytes.NewBuffer(make([]byte,0))
+	s.WriteString(fmt.Sprintf("{%s}",string(self.NodeName)))
+	return s.String()
+}
+
+func (self *LinkStateNodeName) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Value string		`json:"NodeName"`
+	}{
+		Type: self.Type,
+		Value: string(self.NodeName),
+	})
+}
+
+func (self *LinkStateNodeName) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type LinkStateMaxLinkBW struct {
+	Type   LinkStateAttrType
+	Length uint16
+	MaxLinkBW []byte
+}
+
+func NewLinkStateMaxLinkBW()*LinkStateMaxLinkBW {
+	return &LinkStateMaxLinkBW{
+
+	}
+}
+
+func (self *LinkStateMaxLinkBW) DecodeFromBytes(data []byte)error {
+	odata := data
+	offset := uint16(4)
+	self.Type = LS_TLV_TYPE_MAX_LINK_BW
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.MaxLinkBW = odata[offset:offset+self.Length]
+	return nil
+}
+
+func (self *LinkStateMaxLinkBW) Serialize()([]byte,error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf = append(buf,self.MaxLinkBW...)
+	return buf,nil
+}
+
+func (self *LinkStateMaxLinkBW) String()(string){
+	s := bytes.NewBuffer(make([]byte,0))
+	s.WriteString(fmt.Sprintf("{%dMbps}",HexToBW(self.MaxLinkBW)))
+	return s.String()
+}
+
+func (self *LinkStateMaxLinkBW) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Value uint32 		`json:"MaxLinkBW"`
+	}{
+		Type: self.Type,
+		Value: HexToBW(self.MaxLinkBW),
+	})
+}
+
+func (self *LinkStateMaxLinkBW) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type LinkStateMaxResvBW struct {
+	Type   LinkStateAttrType
+	Length uint16
+	MaxResvBW []byte
+}
+
+func NewLinkStateMaxResvBW()*LinkStateMaxResvBW {
+	return &LinkStateMaxResvBW{
+
+	}
+}
+
+func (self *LinkStateMaxResvBW) DecodeFromBytes(data []byte)error {
+	odata := data
+	offset := uint16(4)
+	self.Type = LS_TLV_TYPE_MAX_RES_BW
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.MaxResvBW = odata[offset:offset+self.Length]
+	return nil
+}
+
+func (self *LinkStateMaxResvBW) Serialize()([]byte,error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf = append(buf,self.MaxResvBW...)
+	return buf,nil
+}
+
+func (self *LinkStateMaxResvBW) String()(string){
+	s := bytes.NewBuffer(make([]byte,0))
+	s.WriteString(fmt.Sprintf("{%dMbps}",HexToBW(self.MaxResvBW)))
+	return s.String()
+
+}
+
+func (self *LinkStateMaxResvBW) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Value uint32 		`json:"MaxResvBW"`
+	}{
+		Type: self.Type,
+		Value: HexToBW(self.MaxResvBW),
+	})
+}
+
+func (self *LinkStateMaxResvBW) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type LinkStateAdminGroup struct {
+	Type   LinkStateAttrType
+	Length uint16
+	AdminGroup []byte
+}
+
+func NewLinkStateAdminGroup()*LinkStateAdminGroup {
+	return &LinkStateAdminGroup{
+
+	}
+}
+
+func (self *LinkStateAdminGroup) DecodeFromBytes(data []byte)error {
+	odata := data
+	offset := uint16(4)
+	self.Type = LS_TLV_TYPE_COLOR
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.AdminGroup = odata[offset:offset+self.Length]
+	return nil
+}
+
+func (self *LinkStateAdminGroup) Serialize()([]byte,error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf = append(buf,self.AdminGroup...)
+	return buf,nil
+}
+
+func (self *LinkStateAdminGroup) String()(string){
+	return fmt.Sprintf("")
+
+}
+
+func (self *LinkStateAdminGroup) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Value []byte 		`json:"value"`
+	}{
+		Type: self.Type,
+		Value: self.AdminGroup,
+	})
+}
+
+func (self *LinkStateAdminGroup) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type LinkStateUnResvBW struct {
+	Type   LinkStateAttrType
+	Length uint16
+	UnResvBW []byte
+}
+
+func NewLinkStateUnResvBW()*LinkStateUnResvBW {
+	return &LinkStateUnResvBW{
+
+	}
+}
+
+func (self *LinkStateUnResvBW) DecodeFromBytes(data []byte)error {
+	odata := data
+	offset := uint16(4)
+	self.Type = LS_TLV_TYPE_UNRES_BW
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.UnResvBW = odata[offset:offset+self.Length]
+	return nil
+}
+
+func (self *LinkStateUnResvBW) Serialize()([]byte,error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf = append(buf,self.UnResvBW...)
+	return buf,nil
+}
+
+func (self *LinkStateUnResvBW) String()(string){
+	/*
+	bwMap := make(map[int]uint32)
+
+	bdata := self.UnResvBW
+	for i:=0;i<8;i++ {
+		bwMap[i] = HexToBW(bdata[0:4])
+		bdata = bdata[4:]
+	}*/
+	s := bytes.NewBuffer(make([]byte,0))
+	/*
+	for i:=0;i<8;i++ {
+		s.WriteString(fmt.Sprintf("{Priority%d:BW:%d}",i,bwMap[i]))
+	}*/
+	return s.String()
+}
+
+func (self *LinkStateUnResvBW) MarshalJSON()([]byte,error) {
+	bwMap := make(map[int]uint32)
+	bdata := self.UnResvBW
+	for i:=0;i<8;i++ {
+		bwMap[i] = HexToBW(bdata[0:4])
+		bdata = bdata[4:]
+	}
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Value map[int]uint32    `json:"UnresvBW"`
+	}{
+		Type: self.Type,
+		Value: bwMap,
+	})
+}
+
+func (self *LinkStateUnResvBW) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type LinkStatePrefixMetric struct {
+	Type   LinkStateAttrType
+	Length uint16
+	PrefixMetric uint32
+}
+
+func NewLinkStatePrefixMetric()*LinkStatePrefixMetric {
+	return &LinkStatePrefixMetric{
+
+	}
+}
+
+func (self *LinkStatePrefixMetric) DecodeFromBytes(data []byte)error {
+	odata := data
+	self.Type = LS_TLV_TYPE_PREFIX_METRIC
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.PrefixMetric = binary.BigEndian.Uint32(odata[4:8])
+	return nil
+}
+
+func (self *LinkStatePrefixMetric) Serialize()([]byte,error){
+	buf := make([]byte,4+self.Length)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	binary.BigEndian.PutUint32(buf[4:8],uint32(self.PrefixMetric))
+	return buf,nil
+}
+
+func (self *LinkStatePrefixMetric) String()(string){
+	s := bytes.NewBuffer(make([]byte,0))
+	s.WriteString(fmt.Sprintf("{Metric:%d}",self.PrefixMetric))
+	return s.String()
+}
+
+func (self *LinkStatePrefixMetric) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Value uint32 `json:"PrefixMetric"`
+	}{
+		Type: self.Type,
+		Value: self.PrefixMetric,
+	})
+}
+
+func (self *LinkStatePrefixMetric) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type LinkStateTEDEFMetric struct {
+	Type   LinkStateAttrType
+	Length uint16
+	DefaultMetric []byte
+}
+
+func NewLinkStateTEDEFMetric()*LinkStateTEDEFMetric {
+	return &LinkStateTEDEFMetric{
+
+	}
+}
+
+func (self *LinkStateTEDEFMetric) DecodeFromBytes(data []byte)error {
+	odata := data
+	self.Type = LS_TLV_TYPE_TE_DEF_METRIC
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.DefaultMetric = odata[4:4+self.Length]
+	return nil
+}
+
+func (self *LinkStateTEDEFMetric) Serialize()([]byte,error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf = append(buf,self.DefaultMetric...)
+	return buf,nil
+}
+
+func (self *LinkStateTEDEFMetric) String()(string){
+	s := bytes.NewBuffer(make([]byte,0))
+	//s.WriteString(fmt.Sprintf("{DFCost:%v}",HexToInt(self.DefaultMetric)))
+	return s.String()
+}
+
+func (self *LinkStateTEDEFMetric) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Cost uint32	       `json:"value"`
+
+	}{
+		Type: self.Type,
+		Cost: HexToInt(self.DefaultMetric),
+	})
+}
+
+func (self *LinkStateTEDEFMetric) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type SRAttrFlag uint8
+
+const (
+	SR_ATTR_FLAG_RE_ADVERTISEMENT 		SRAttrFlag = 1 << 7
+	SR_ATTR_FLAG_NODE_SID		  	SRAttrFlag = 1 << 6
+	SR_ATTR_FLAG_NO_PHP			SRAttrFlag = 1 << 5
+	SR_ATTR_FLAG_EXPLICIT_NULL    		SRAttrFlag = 1 << 4
+	SR_ATTR_FLAG_VALUE			SRAttrFlag = 1 << 3
+	SR_ATTR_LOCAL			      	SRAttrFlag = 1 << 2
+)
+
+func (self SRAttrFlag) String() string {
+	strs := make([]string,0,6)
+
+	if self&SR_ATTR_FLAG_RE_ADVERTISEMENT > 0 {
+		strs = append(strs,"R")
+	}
+	if self&SR_ATTR_FLAG_NODE_SID > 0 {
+		strs = append(strs,"N")
+	}
+	if self&SR_ATTR_FLAG_NO_PHP > 0 {
+		strs = append(strs,"P")
+	}
+	if self&SR_ATTR_FLAG_EXPLICIT_NULL > 0 {
+		strs = append(strs,"E")
+	}
+	if self&SR_ATTR_FLAG_VALUE	 > 0 {
+		strs = append(strs,"V")
+	}
+	if self&SR_ATTR_LOCAL > 0 {
+		strs = append(strs,"L")
+	}
+	return strings.Join(strs, "|")
+}
+
+type PrefixSid struct {
+	Type LinkStateAttrType
+	Length uint16
+	Flags SRAttrFlag
+	Algorithm uint8
+	Reserved uint16
+	Label []byte
+}
+
+func NewPrefixSid()*PrefixSid {
+	return &PrefixSid{
+
+	}
+}
+
+func (self *PrefixSid) DecodeFromBytes(data []byte)error {
+	odata := data
+	self.Type = LS_TLV_TYPE_PREFIX_SID
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.Flags = SRAttrFlag(odata[4])
+	self.Algorithm = uint8(odata[5])
+	self.Reserved = binary.BigEndian.Uint16(odata[6:8])
+	self.Label = odata[8:11]
+	return nil
+}
+
+func (self *PrefixSid) Serialize()([]byte,error){
+	buf := make([]byte,8)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf[4] = uint8(self.Flags)
+	buf[5] = self.Algorithm
+	binary.BigEndian.PutUint16(buf[6:8],uint16(self.Reserved))
+	buf = append(buf,self.Label...)
+	return buf,nil
+}
+
+func (self *PrefixSid) String()(string){
+	s := bytes.NewBuffer(make([]byte,0))
+	s.WriteString(fmt.Sprintf("SID:%d",ParseLabel(self.Label)))
+	return s.String()
+}
+
+func (self *PrefixSid) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		Value uint32		`json:"prefixsid"`
+
+	}{
+		Type: self.Type,
+		Value: ParseLabel(self.Label),
+
+	})
+}
+
+func (self *PrefixSid) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type LanAdjSidTlv struct {
+	Type LinkStateAttrType
+	Length uint16
+	Flags uint8
+	Weight uint8
+	Reserved uint16
+	ISISID []byte
+	LABEL []byte
+}
+
+func NewLanAdjSidTlv()*LanAdjSidTlv {
+	return &LanAdjSidTlv{
+
+	}
+}
+
+func (self *LanAdjSidTlv) DecodeFromBytes(data []byte)error {
+	odata := data
+	self.Type = LS_TLV_TYPE_LAN_ADJ_SID
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.Flags = uint8(odata[4])
+	self.Weight = uint8(odata[5])
+	self.Reserved = binary.BigEndian.Uint16(odata[6:8])
+	self.ISISID = odata[8:14]
+	self.LABEL = odata[14:17]
+	return nil
+}
+
+func (self *LanAdjSidTlv) Serialize()([]byte,error){
+	buf := make([]byte,8)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf[4] = uint8(self.Flags)
+	buf[5] = uint8(self.Weight)
+	binary.BigEndian.PutUint16(buf[6:8],uint16(self.Reserved))
+	buf = append(buf,self.ISISID...)
+	buf = append(buf,self.LABEL...)
+	return buf,nil
+}
+
+func (self *LanAdjSidTlv) String()(string){
+	s := bytes.NewBuffer(make([]byte,0))
+	s.WriteString(fmt.Sprintf("[%s:%v]",isisNodeformat(self.ISISID),ParseLabel(self.LABEL)))
+	return s.String()
+}
+
+func (self *LanAdjSidTlv) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		ISISNode string 	`json:"isisnode"`
+		AdjLabel uint32		`json:"AdjLabel"`
+
+	}{
+		Type: self.Type,
+		ISISNode: isisNodeformat(self.ISISID),
+		AdjLabel: ParseLabel(self.LABEL),
+
+	})
+}
+
+func (self *LanAdjSidTlv) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type AdjSidFlag uint8
+
+const (
+	BGP_LINKSTATE_ADJ_SID_ADDRESS_FAMILY AdjSidFlag = 1 << 7
+	BGP_LINKSTATE_ADJ_SID_BACKUP 	     AdjSidFlag = 1 << 6
+	BGP_LINKSTATE_ADJ_SID_VALUE          AdjSidFlag = 1 << 5
+	BGP_LINKSTATE_ADJ_SID_LOCAL          AdjSidFlag = 1 << 4
+	BGP_LINKSTATE_ADJ_SID_SET            AdjSidFlag = 1 << 3
+)
+
+func (self AdjSidFlag) String() string {
+	strs := make ([]string,0,5)
+
+	if self&BGP_LINKSTATE_ADJ_SID_ADDRESS_FAMILY > 0 {
+		strs = append(strs,"F")
+	}
+	if self&BGP_LINKSTATE_ADJ_SID_BACKUP > 0 {
+		strs = append(strs,"B")
+	}
+	if self&BGP_LINKSTATE_ADJ_SID_VALUE > 0 {
+		strs = append(strs,"V")
+	}
+	if self&BGP_LINKSTATE_ADJ_SID_LOCAL > 0 {
+		strs = append(strs,"L")
+	}
+	if self&BGP_LINKSTATE_ADJ_SID_SET > 0 {
+		strs = append(strs,"S")
+	}
+	return strings.Join(strs, "|")
+}
+
+type AdjSidTlv struct {
+	Type LinkStateAttrType
+	Length uint16
+	Flags AdjSidFlag
+	Weight uint8
+	Reserved uint16
+	AdjLABEL []byte
+}
+
+func NewAdjSidTlv()*AdjSidTlv {
+	return &AdjSidTlv{
+
+	}
+}
+
+func (self *AdjSidTlv) DecodeFromBytes(data []byte)error {
+	odata := data
+	self.Type = LS_TLV_TYPE_ADJ_SID
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.Flags = AdjSidFlag(odata[4])
+	self.Weight = uint8(odata[5])
+	self.Reserved = binary.BigEndian.Uint16(odata[6:8])
+	self.AdjLABEL = odata[8:(8+self.Length)-4]
+	return nil
+}
+
+func (self *AdjSidTlv) Serialize()([]byte,error){
+	buf := make([]byte,8)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf[4] = uint8(self.Flags)
+	buf[5] = uint8(self.Weight)
+	binary.BigEndian.PutUint16(buf[6:8],uint16(self.Reserved))
+	buf = append(buf,self.AdjLABEL...)
+	return buf,nil
+}
+
+func (self *AdjSidTlv) String()(string){
+	s := bytes.NewBuffer(make([]byte,0))
+	s.WriteString(fmt.Sprintf("[%v]",ParseLabel(self.AdjLABEL)))
+	return s.String()
+}
+
+func (self *AdjSidTlv) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type LinkStateAttrType `json:"type"`
+		AdjLabel uint32		`json:"AdjLabel"`
+		Flags AdjSidFlag		`json:"AdjSidFlags"`
+
+	}{
+		Type: self.Type,
+		AdjLabel: ParseLabel(self.AdjLABEL),
+		Flags: self.Flags,
+
+	})
+}
+
+func (self *AdjSidTlv) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+
+type SRCapSubTlvType uint16
+type SRCapAttrFlag uint8
+
+const (
+	SR_CAP_SUBTLV_SID_LABEL	SRCapSubTlvType = 1161
+)
+const (
+	BGP_LINKSTATE_SR_CAP_MPLS_IPV4 SRCapAttrFlag = 1 << 7
+	BGP_LINKSTATE_SR_CAP_MPLS_IPV6 SRCapAttrFlag = 1 << 6
+	BGP_LINKSTATE_SR_CAP_SR_IPV6   SRCapAttrFlag = 1 << 5
+)
+
+func (self SRCapAttrFlag) String() string {
+	strs := make([]string,0,2)
+
+	if self&BGP_LINKSTATE_SR_CAP_MPLS_IPV4 > 0 {
+		strs = append(strs,"I")
+	}
+	if self&BGP_LINKSTATE_SR_CAP_MPLS_IPV6 > 0 {
+		strs = append(strs,"V")
+	}
+	if self&BGP_LINKSTATE_SR_CAP_SR_IPV6 > 0 {
+		strs = append(strs,"H")
+	}
+	return strings.Join(strs, "|")
+}
+
+type SRCapSubTlvValue interface {
+	Serialize()([]byte,error)
+	DecodeFromBytes(data []byte) error
+	String() string
+	MarshalJSON()([]byte,error)
+	Len()int
+}
+
+type SRCapTlv struct {
+	Type LinkStateAttrType
+	Length uint16
+	Flags SRCapAttrFlag
+	Reserved uint8
+	Range []byte
+	Value []SRCapSubTlvValue
+}
+
+func NewSRCapSubTlv (Type uint16) (SRCapSubTlvValue,error){
+	tlvType := SRCapSubTlvType(Type)
+	switch tlvType {
+	case SR_CAP_SUBTLV_SID_LABEL:
+		return NewSRCapSubTlvSIDLabel(),nil
+	}
+	return &PathAttributeUnknown{},nil
+}
+
+func NewSRCapTlv() *SRCapTlv {
+	return &SRCapTlv {
+
+	}
+}
+
+func (self *SRCapTlv) DecodeFromBytes(data []byte)error {
+	odata := data
+	eCode := uint8(BGP_ERROR_UPDATE_MESSAGE_ERROR)
+	eSubCode := uint8(BGP_ERROR_SUB_ATTRIBUTE_LENGTH_ERROR)
+	self.Type = LS_TLV_TYPE_SR_CAPABILITIES
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.Flags = SRCapAttrFlag(odata[4])
+	self.Reserved = uint8(odata[5])
+	self.Range = odata[6:9]
+	value := odata[9:]
+
+	for len(value) > 0 {
+		tlvType:= binary.BigEndian.Uint16(value[0:2])
+		srCapSubTlv,err := NewSRCapSubTlv(tlvType)
+		if err != nil {
+			return err
+		}
+		err = srCapSubTlv.DecodeFromBytes(value)
+		if err != nil {
+			return err
+		}
+		if srCapSubTlv.Len() > len(value){
+			return NewMessageError(eCode, eSubCode, value, "prefix length is incorrect")
+		}
+
+		value = value[srCapSubTlv.Len():]
+		self.Value = append(self.Value,srCapSubTlv)
+	}
+	return nil
+}
+
+func (self *SRCapTlv) Serialize() ([]byte,error) {
+	buf := make([]byte,6)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf[4] = uint8(self.Flags)
+	buf[5] = self.Reserved
+	buf = append(buf,self.Range...)
+	for _,srCapSubTlv := range self.Value {
+		pbuf,err := srCapSubTlv.Serialize()
+		if err != nil {
+			return nil,err
+		}
+		buf = append(buf,pbuf...)
+	}
+
+	return buf,nil
+}
+
+func (self *SRCapTlv) String() string {
+	s := bytes.NewBuffer(make([]byte,0))
+	s.WriteString(fmt.Sprintf("{%d:%v}",ParseLabel(self.Range),self.Value))
+	return s.String()
+}
+
+func (self *SRCapTlv) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Type  LinkStateAttrType `json:"type"`
+		Range uint32		`json:"labelRange"`
+		Value []SRCapSubTlvValue `json:"labelstart"`
+	}{
+		Type: self.Type,
+		Range: ParseLabel(self.Range),
+		Value: self.Value,
+	})
+}
+
+func (self *SRCapTlv) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+type SRCapSubTlvSIDLabel struct {
+	Type   SRCapSubTlvType
+	Length uint16
+	SidLabel []byte
+}
+
+func NewSRCapSubTlvSIDLabel()*SRCapSubTlvSIDLabel{
+	return &SRCapSubTlvSIDLabel {
+
+	}
+}
+
+func (self *SRCapSubTlvSIDLabel) DecodeFromBytes(data []byte)error {
+	odata := data
+	self.Type = SR_CAP_SUBTLV_SID_LABEL
+	self.Length = binary.BigEndian.Uint16(odata[2:4])
+	self.SidLabel = odata[OFFSET_TLV_TYPE_LENGTH:OFFSET_TLV_TYPE_LENGTH+self.Length]
+	return nil
+}
+
+func (self *SRCapSubTlvSIDLabel) Serialize()([]byte,error){
+	buf := make([]byte,4)
+	binary.BigEndian.PutUint16(buf[0:2],uint16(self.Type))
+	binary.BigEndian.PutUint16(buf[2:4],uint16(self.Length))
+	buf = append(buf,self.SidLabel...)
+	return buf,nil
+}
+
+func (self *SRCapSubTlvSIDLabel) String()(string){
+	s := bytes.NewBuffer(make([]byte,0))
+	s.WriteString(fmt.Sprintf("%d",ParseLabel(self.SidLabel)))
+	return s.String()
+}
+
+func (self *SRCapSubTlvSIDLabel) MarshalJSON()([]byte,error) {
+	return json.Marshal(struct {
+		Type SRCapSubTlvType `json:"type"`
+		Label uint32 	`json:"label"`
+
+	}{
+		Type: self.Type,
+		Label: ParseLabel(self.SidLabel),
+
+	})
+}
+
+func (self *SRCapSubTlvSIDLabel) Len()int {
+	offset := uint16(4)
+	return int(self.Length+offset)
+}
+
+func GetProtocolType(id uint8)(string){
+	switch id {
+	case 2:
+		return "ISIS:L2"
+	case 1:
+		return "ISIS:L1"
+	default:
+		return "UnKnownIGP"
+	}
+	return ""
+}
+
+func Long2IP(ipLong uint32) string {
+	ipByte := make([]byte,4)
+	binary.BigEndian.PutUint32(ipByte,ipLong)
+	ip := net.IP(ipByte)
+	return ip.String()
+}
+
+func HexToIP(b []byte) string {
+	var tmpIP []string
+
+	prefixLen := len(b)
+	for _, v := range b {
+		tmpIP = append(tmpIP,strconv.Itoa(int(v)))
+	}
+	strIP := strings.Join(tmpIP,".")
+	switch prefixLen {
+	case 1:
+		strIP = strIP+".0.0.0"
+	case 2:
+		strIP = strIP+".0.0"
+	case 3:
+		strIP = strIP+".0"
+	case 4:
+		strIP = strIP
+	}
+	return strIP
+}
+
+func isisNodeformat(data []byte) string{
+	buf:= &bytes.Buffer{}
+	var str string
+	err := binary.Write(buf,binary.BigEndian,data)
+	if err != nil {
+		panic(err)
+	}
+	s:= hex.EncodeToString(buf.Bytes())
+	if len(buf.Bytes()) == 6 {
+		for i:=0;i<len(s);i=i+4 {
+			str = str+string(s[i:i+4])
+			str = str+"."
+		}
+		str = str+"00"
+	} else if len(buf.Bytes()) == 7 {
+		for i:=0;i< 12;i=i+4 {
+			str = str+string(s[i:i+4])
+			str = str+"."
+		}
+		str = str+string(s[12:14])
+	} else {
+		fmt.Println("ISIS_Node_Format: Input Length doesnt match 6 or 7")
+	}
+	return str
+}
+
+func HexToString(data []byte)string{
+	buf:= &bytes.Buffer{}
+	err := binary.Write(buf,binary.BigEndian,data)
+	if err != nil {
+		panic(err)
+	}
+	strFmt := hex.EncodeToString(buf.Bytes())
+
+	return strFmt
+}
+
+func HexToBW(data []byte) uint32 {
+	const BITS_IN_A_BYTE = 8
+	const KILO = 1000
+	var f float32
+	s := HexToString(data)
+	b,err := hex.DecodeString(s)
+	if err != nil {
+		fmt.Println("Error Occured")
+	}
+	buf := bytes.NewReader(b)
+	err = binary.Read(buf,binary.BigEndian,&f)
+	if err != nil {
+		fmt.Println("Error Occured")
+	}
+	intBw := uint32(f) * BITS_IN_A_BYTE
+	kbps := intBw/KILO
+	mbps := kbps/KILO
+	return mbps
+}
+
+func HexToInt(data []byte) uint32 {
+	len := len(data)
+	metric := uint32(0)
+	switch len {
+	case 1:
+		metric := uint32(data[0])
+		return metric
+	case 2:
+		metric := uint32(data[0])<<8 | uint32(data[1])
+		return metric
+	case 3:
+		metric := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
+		return metric
+	case 4:
+		metric := uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
+		return metric
+	}
+	return metric
+}
+
+func ParseLabel(data []byte) uint32 {
+	len := len(data)
+	var label uint32
+	switch len {
+	case 3:
+		mask := 0x0F
+		data [0] = data[0]& byte(mask)
+		label = uint32(data[0]) << 16 | uint32(data[1]) << 8 | uint32(data[2])
+	case 4:
+
+	}
+	return label
 }
